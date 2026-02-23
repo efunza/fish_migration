@@ -1,18 +1,15 @@
 # fish_Migration.py
-# Streamlit Cloud-ready (FIXED): Satellite Ocean Temperature vs Fish Migration Study
+# Streamlit Cloud-ready (MORE ROBUST): Satellite Ocean Temperature vs Fish Migration Study
 #
-# Fixes:
-# - Prevents ".dt" errors by forcing datetime conversion
-# - Prevents crashes from HTTPError by handling download failures gracefully
-# - Adds fallback SST/temperature anomaly source if NOAA ERSST link is blocked on Streamlit Cloud
+# Fixes included:
+# ✅ Forces Date column to datetime (prevents ".dt" accessor errors)
+# ✅ Never crashes on HTTP errors (handles blocked/down sources gracefully)
+# ✅ Uses multiple fallback URLs (NOAA -> GitHub raw -> DataHub)
+# ✅ Parses CSV even if column names change (case/whitespace/BOM tolerant)
 #
-# Run locally:
+# Local run:
 #   pip install -r requirements.txt
 #   streamlit run fish_Migration.py
-#
-# Streamlit Cloud:
-#   Main file: fish_Migration.py
-#   (Optional) Add OPENAI_API_KEY in Secrets
 
 from __future__ import annotations
 
@@ -44,124 +41,207 @@ st.set_page_config(
 )
 
 st.title("🌊 Satellite Ocean Temperature vs Fish Migration Study")
-st.caption(
-    "Visualize temperature anomalies over time and compare them with fish catch/migration data."
-)
+st.caption("Plot temperature anomalies over time and compare them with fish catch/migration data (monthly).")
 
 
 # -----------------------------
-# DATA SOURCES (with fallback)
+# DATA SOURCES
 # -----------------------------
-# Primary (sometimes blocked/unstable from Streamlit Cloud): NOAA ERSST v5 anomaly index text file
+# Primary (true SST anomalies, global index)
 NOAA_ERSST_URL = "https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.anom.data"
 
-# Fallback (usually very reliable): DataHub monthly global temperature anomalies (Land+Ocean)
-# This is not pure SST, but it's an excellent proxy dataset for trend/correlation demos.
-DATAHUB_GLOBAL_TEMP_MONTHLY_CSV = "https://datahub.io/core/global-temp/r/monthly.csv"
+# Fallback 1 (very reliable): GitHub raw from datasets/global-temp (Land+Ocean anomalies)
+GITHUB_GLOBAL_TEMP_MONTHLY = "https://raw.githubusercontent.com/datasets/global-temp/main/data/monthly.csv"
+
+# Fallback 2: DataHub (may redirect/behave oddly on Streamlit Cloud; kept as last resort)
+DATAHUB_GLOBAL_TEMP_MONTHLY = "https://datahub.io/core/global-temp/r/monthly.csv"
 
 
-def _http_get(url: str) -> requests.Response:
-    """HTTP GET with a user-agent (helps some hosts) and timeouts."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Streamlit; EducationalProject) Python requests"
-    }
-    return requests.get(url, headers=headers, timeout=30)
+def http_get_text(url: str, timeout: int = 30) -> Tuple[Optional[str], Optional[str]]:
+    """Return (text, error). Never raises."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Streamlit Educational App)"}
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        text = r.text
+        if not text or not text.strip():
+            return None, "Empty response"
+        return text, None
+    except Exception as e:
+        return None, str(e)
+
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip whitespace and BOM characters from column names."""
+    df = df.copy()
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    return df
+
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """Find a column in df matching any candidate (case-insensitive)."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
+    return None
+
+
+def parse_noaa_ersst(text: str) -> pd.DataFrame:
+    """
+    Parse NOAA ERSST v5 anomaly index text:
+    rows: YEAR then 12 monthly anomalies.
+    Output: Date, Temp_Anomaly
+    """
+    rows = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 13:
+            continue
+        try:
+            year = int(parts[0])
+        except Exception:
+            continue
+
+        for month in range(1, 13):
+            try:
+                anomaly = float(parts[month])
+            except Exception:
+                continue
+            rows.append((datetime(year, month, 1), anomaly))
+
+    df = pd.DataFrame(rows, columns=["Date", "Temp_Anomaly"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Temp_Anomaly"] = pd.to_numeric(df["Temp_Anomaly"], errors="coerce")
+    df = df.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
+    return df
+
+
+def parse_monthly_csv(text: str) -> pd.DataFrame:
+    """
+    Parse a monthly anomaly CSV. Tries to auto-detect columns even if names change.
+    Expected typical columns: Source, Date, Mean
+    Output: Date, Temp_Anomaly
+    """
+    from io import StringIO
+
+    df = pd.read_csv(StringIO(text))
+    df = clean_columns(df)
+
+    # Try common schema first
+    date_col = find_col(df, ["Date", "date", "Month", "month", "time", "Time"])
+    mean_col = find_col(df, ["Mean", "mean", "Anomaly", "anomaly", "Value", "value", "Temp_Anomaly", "temp_anomaly"])
+
+    # Some datasets may use "Year" + "Month" columns
+    year_col = find_col(df, ["Year", "year", "YYYY"])
+    mon_col = find_col(df, ["Month", "month", "MM"])
+
+    if date_col and mean_col:
+        out = df[[date_col, mean_col]].copy()
+        out.columns = ["Date", "Temp_Anomaly"]
+    elif year_col and mon_col and mean_col:
+        out = df[[year_col, mon_col, mean_col]].copy()
+        out["Date"] = pd.to_datetime(
+            out[year_col].astype(str) + "-" + out[mon_col].astype(str).str.zfill(2) + "-01",
+            errors="coerce",
+        )
+        out = out.rename(columns={mean_col: "Temp_Anomaly"})[["Date", "Temp_Anomaly"]]
+    else:
+        # Last-resort: try first date-like column + first numeric column
+        possible_date_cols = []
+        for c in df.columns:
+            try_dates = pd.to_datetime(df[c], errors="coerce")
+            if try_dates.notna().mean() > 0.8:  # mostly parseable
+                possible_date_cols.append(c)
+
+        numeric_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
+
+        if possible_date_cols and numeric_cols:
+            out = df[[possible_date_cols[0], numeric_cols[0]]].copy()
+            out.columns = ["Date", "Temp_Anomaly"]
+        else:
+            raise ValueError(f"Could not detect Date/Value columns. Columns found: {list(df.columns)}")
+
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["Temp_Anomaly"] = pd.to_numeric(out["Temp_Anomaly"], errors="coerce")
+    out = out.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
+    return out
 
 
 @st.cache_data(show_spinner=False)
-def load_temperature_data() -> Tuple[pd.DataFrame, str]:
+def load_temperature_data() -> Tuple[pd.DataFrame, str, list[str]]:
     """
-    Try NOAA ERSST anomaly index first.
-    If it fails (HTTP error / blocked), fall back to DataHub monthly global temp anomalies.
-
-    Returns:
-      df: columns [Date (datetime64), Temp_Anomaly (float)]
-      source_name: description string
+    Returns: (df, source_name, notes)
+    df columns: Date (datetime64), Temp_Anomaly (float)
     """
-    # -------- Try NOAA ERSST text format --------
-    try:
-        r = _http_get(NOAA_ERSST_URL)
-        if r.status_code == 200 and r.text.strip():
-            rows = []
-            for line in r.text.splitlines():
-                parts = line.strip().split()
-                # Expect: year + 12 monthly anomalies (13+ tokens)
-                if len(parts) < 13:
-                    continue
-                try:
-                    year = int(parts[0])
-                except Exception:
-                    continue
+    notes: list[str] = []
 
-                for month in range(1, 13):
-                    try:
-                        anomaly = float(parts[month])
-                    except Exception:
-                        continue
-                    rows.append((datetime(year, month, 1), anomaly))
-
-            df = pd.DataFrame(rows, columns=["Date", "Temp_Anomaly"])
-
-            # Force datetime + numeric (prevents .dt errors)
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df["Temp_Anomaly"] = pd.to_numeric(df["Temp_Anomaly"], errors="coerce")
-            df = df.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
-
+    # 1) NOAA ERSST (SST anomalies)
+    text, err = http_get_text(NOAA_ERSST_URL)
+    if text:
+        try:
+            df = parse_noaa_ersst(text)
             if not df.empty:
-                return df, "NOAA ERSST v5 (global SST anomaly index)"
-    except Exception:
-        pass
+                return df, "NOAA ERSST v5 (global SST anomaly index)", notes
+            notes.append("NOAA ERSST parsed but produced empty dataframe.")
+        except Exception as e:
+            notes.append(f"NOAA parse failed: {e}")
+    else:
+        notes.append(f"NOAA ERSST download failed: {err}")
 
-    # -------- Fallback: DataHub monthly global temp anomalies CSV --------
-    r2 = _http_get(DATAHUB_GLOBAL_TEMP_MONTHLY_CSV)
-    if r2.status_code != 200:
-        raise RuntimeError(
-            f"Could not download temperature data. "
-            f"NOAA status: unavailable; DataHub status: {r2.status_code}"
-        )
+    # 2) GitHub raw global-temp monthly (Land+Ocean anomalies; proxy fallback)
+    text, err = http_get_text(GITHUB_GLOBAL_TEMP_MONTHLY)
+    if text:
+        try:
+            df = parse_monthly_csv(text)
+            if not df.empty:
+                notes.append("Using Land+Ocean anomaly dataset as fallback (not pure SST).")
+                return df, "GitHub datasets/global-temp monthly (Land+Ocean anomalies; fallback)", notes
+            notes.append("GitHub fallback parsed but produced empty dataframe.")
+        except Exception as e:
+            notes.append(f"GitHub fallback parse failed: {e}")
+    else:
+        notes.append(f"GitHub fallback download failed: {err}")
 
-    df2 = pd.read_csv(pd.io.common.StringIO(r2.text))
+    # 3) DataHub monthly.csv (last resort)
+    text, err = http_get_text(DATAHUB_GLOBAL_TEMP_MONTHLY)
+    if text:
+        try:
+            df = parse_monthly_csv(text)
+            if not df.empty:
+                notes.append("Using DataHub fallback (Land+Ocean anomalies; not pure SST).")
+                return df, "DataHub global-temp monthly (fallback)", notes
+            notes.append("DataHub fallback parsed but produced empty dataframe.")
+        except Exception as e:
+            notes.append(f"DataHub fallback parse failed: {e}")
+    else:
+        notes.append(f"DataHub fallback download failed: {err}")
 
-    # DataHub format: Source, Date (YYYY-MM), Mean
-    if "Date" not in df2.columns or "Mean" not in df2.columns:
-        raise RuntimeError("Fallback dataset format changed (missing Date/Mean columns).")
-
-    df2 = df2.rename(columns={"Mean": "Temp_Anomaly"})
-    df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce")
-    df2["Temp_Anomaly"] = pd.to_numeric(df2["Temp_Anomaly"], errors="coerce")
-    df2 = df2.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
-
-    # Optional: let user pick which source (GCAG vs GISTEMP) later; for now keep both
-    # (Still works fine for graphs/correlation)
-    return df2, "DataHub Global Temp (Land+Ocean anomalies; proxy fallback)"
+    return pd.DataFrame(columns=["Date", "Temp_Anomaly"]), "None", notes
 
 
 # -----------------------------
-# LOAD DATA (safe error handling)
+# LOAD TEMPERATURE DATA
 # -----------------------------
-try:
-    with st.spinner("Loading temperature anomaly data..."):
-        df, source_name = load_temperature_data()
-except Exception as e:
-    st.error("Failed to load temperature data from the internet.")
-    st.write("Details (safe):", str(e))
-    st.info(
-        "If you’re on Streamlit Cloud, some NOAA endpoints can be blocked or temporarily down. "
-        "Try again later, or use the 'Upload your own SST CSV' option below."
-    )
-    df = pd.DataFrame(columns=["Date", "Temp_Anomaly"])
-    source_name = "None"
+with st.spinner("Loading temperature anomaly data (with fallbacks)..."):
+    df, source_name, notes = load_temperature_data()
+
+if notes:
+    with st.expander("Data loading notes (click to view)"):
+        for n in notes:
+            st.write("•", n)
 
 if df.empty:
-    st.subheader("⬇️ Upload your own SST / temperature anomaly CSV (backup option)")
-    st.markdown(
-        "Upload a CSV with a **Date** column and a **Temp_Anomaly** column (or choose columns after upload)."
-    )
+    st.error("Could not load any temperature anomaly dataset from the internet.")
+    st.info("Upload your own SST/temperature CSV below to continue (Date + anomaly/value column).")
+
     up = st.file_uploader("Upload temperature CSV", type=["csv"])
     if up is None:
         st.stop()
 
     user_df = pd.read_csv(up)
+    user_df = clean_columns(user_df)
     st.dataframe(user_df.head(10))
 
     date_col = st.selectbox("Select date column", options=user_df.columns)
@@ -202,7 +282,7 @@ if filtered_df.empty:
 
 
 # -----------------------------
-# PLOT TEMPERATURE ANOMALIES
+# PLOT ANOMALIES
 # -----------------------------
 st.subheader("📈 Temperature Anomalies Over Time")
 
@@ -223,7 +303,7 @@ x = filtered_df["Date"].map(datetime.toordinal).to_numpy()
 y = filtered_df["Temp_Anomaly"].to_numpy()
 
 if len(x) >= 2:
-    slope_per_day, intercept = np.polyfit(x, y, 1)
+    slope_per_day, _ = np.polyfit(x, y, 1)
     slope_per_year = slope_per_day * 365.25
     st.write(f"Estimated trend: **{slope_per_year:.4f} °C per year**")
 else:
@@ -248,13 +328,14 @@ st.markdown(
 )
 
 fish_upload = st.file_uploader("Upload fish CSV", type=["csv"], key="fish_csv")
-
 merged = None
 
 if fish_upload is not None:
     try:
         fish_df = pd.read_csv(fish_upload)
-        st.write("Preview:")
+        fish_df = clean_columns(fish_df)
+
+        st.write("Preview of fish data:")
         st.dataframe(fish_df.head(10))
 
         fish_date_col = st.selectbox("Fish date column", options=fish_df.columns, key="fish_date")
@@ -295,9 +376,7 @@ if fish_upload is not None:
 # -----------------------------
 st.subheader("🧪 Demonstration: Simulated Poleward Shift (if no fish data)")
 
-st.caption(
-    "This is a simple illustration: warming → poleward shift. Replace with real fish data for real conclusions."
-)
+st.caption("Illustration only: warming → poleward shift. Replace with real fish data for real conclusions.")
 
 shift_factor = st.slider("Shift factor (degrees latitude per 1°C anomaly)", 0.0, 5.0, 2.0, 0.1)
 sim_shift = filtered_df["Temp_Anomaly"] * shift_factor
@@ -388,7 +467,7 @@ st.markdown(
 **Goal:** Study how changes in ocean temperature can influence fish migration patterns.
 
 **Method:**
-- Load a public temperature anomaly dataset (preferably SST anomalies; fallback uses a global land+ocean anomaly proxy if needed).
+- Load a public temperature anomaly dataset (preferably SST anomalies).
 - Plot anomalies over time and compute a warming trend.
 - Upload fish catch/migration data and test correlation with temperature anomalies (monthly).
 
@@ -396,7 +475,7 @@ st.markdown(
 Warming oceans can shift where fish live and breed, affecting fisheries, food security, and conservation planning.
 
 **Extensions:**
-- Use regional SST (Indian Ocean / Kenya coast) instead of global.
+- Use *regional* SST (Kenya coast / Indian Ocean) instead of global.
 - Add maps for spatial migration.
 - Compare multiple fish species datasets.
 """
