@@ -271,7 +271,7 @@ if start_year > end_year:
     start_year, end_year = end_year, start_year
 
 use_openai = st.sidebar.toggle("Use AI Interpretation (OpenAI)", value=False)
-model_name = st.sidebar.text_input("OpenAI model", value="gpt-5.2")
+model_name = st.sidebar.text_input("OpenAI model", value="gpt-4o-mini")
 
 filtered_df = df[(df["Date"].dt.year >= start_year) & (df["Date"].dt.year <= end_year)].copy()
 filtered_df = filtered_df.sort_values("Date").reset_index(drop=True)
@@ -480,3 +480,4 @@ Warming oceans can shift where fish live and breed, affecting fisheries, food se
 - Compare multiple fish species datasets.
 """
 )
+
