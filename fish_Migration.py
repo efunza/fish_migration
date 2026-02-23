@@ -1,18 +1,24 @@
 # fish_Migration.py
-# Streamlit Cloud-ready: Satellite SST vs Fish Migration Study (FIXED datetime issue)
+# Streamlit Cloud-ready (FIXED): Satellite Ocean Temperature vs Fish Migration Study
+#
+# Fixes:
+# - Prevents ".dt" errors by forcing datetime conversion
+# - Prevents crashes from HTTPError by handling download failures gracefully
+# - Adds fallback SST/temperature anomaly source if NOAA ERSST link is blocked on Streamlit Cloud
 #
 # Run locally:
 #   pip install -r requirements.txt
 #   streamlit run fish_Migration.py
 #
 # Streamlit Cloud:
-#   Set main file to fish_Migration.py
-#   Add OPENAI_API_KEY in Secrets (optional)
+#   Main file: fish_Migration.py
+#   (Optional) Add OPENAI_API_KEY in Secrets
 
 from __future__ import annotations
 
 import os
 from datetime import datetime
+from typing import Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,67 +45,139 @@ st.set_page_config(
 
 st.title("🌊 Satellite Ocean Temperature vs Fish Migration Study")
 st.caption(
-    "Analyzing how satellite-derived Sea Surface Temperature (SST) anomalies relate to fish migration patterns."
+    "Visualize temperature anomalies over time and compare them with fish catch/migration data."
 )
 
+
 # -----------------------------
-# DATA LOADING (NOAA ERSST v5 anomaly index)
+# DATA SOURCES (with fallback)
 # -----------------------------
-NOAA_URL = "https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.anom.data"
+# Primary (sometimes blocked/unstable from Streamlit Cloud): NOAA ERSST v5 anomaly index text file
+NOAA_ERSST_URL = "https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.anom.data"
+
+# Fallback (usually very reliable): DataHub monthly global temperature anomalies (Land+Ocean)
+# This is not pure SST, but it's an excellent proxy dataset for trend/correlation demos.
+DATAHUB_GLOBAL_TEMP_MONTHLY_CSV = "https://datahub.io/core/global-temp/r/monthly.csv"
+
+
+def _http_get(url: str) -> requests.Response:
+    """HTTP GET with a user-agent (helps some hosts) and timeouts."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Streamlit; EducationalProject) Python requests"
+    }
+    return requests.get(url, headers=headers, timeout=30)
 
 
 @st.cache_data(show_spinner=False)
-def load_sst_data() -> pd.DataFrame:
+def load_temperature_data() -> Tuple[pd.DataFrame, str]:
     """
-    Loads NOAA ERSST v5 global SST anomaly index.
-    Format is whitespace-separated rows: YEAR then 12 monthly anomalies.
-    Returns a DataFrame with columns: Date (datetime64), SST_Anomaly (float).
+    Try NOAA ERSST anomaly index first.
+    If it fails (HTTP error / blocked), fall back to DataHub monthly global temp anomalies.
+
+    Returns:
+      df: columns [Date (datetime64), Temp_Anomaly (float)]
+      source_name: description string
     """
-    r = requests.get(NOAA_URL, timeout=30)
-    r.raise_for_status()
+    # -------- Try NOAA ERSST text format --------
+    try:
+        r = _http_get(NOAA_ERSST_URL)
+        if r.status_code == 200 and r.text.strip():
+            rows = []
+            for line in r.text.splitlines():
+                parts = line.strip().split()
+                # Expect: year + 12 monthly anomalies (13+ tokens)
+                if len(parts) < 13:
+                    continue
+                try:
+                    year = int(parts[0])
+                except Exception:
+                    continue
 
-    rows = []
-    for line in r.text.splitlines():
-        parts = line.strip().split()
-        # Expect year + 12 monthly values = 13 tokens
-        if len(parts) < 13:
-            continue
+                for month in range(1, 13):
+                    try:
+                        anomaly = float(parts[month])
+                    except Exception:
+                        continue
+                    rows.append((datetime(year, month, 1), anomaly))
 
-        try:
-            year = int(parts[0])
-        except Exception:
-            continue
+            df = pd.DataFrame(rows, columns=["Date", "Temp_Anomaly"])
 
-        for month in range(1, 13):
-            try:
-                anomaly = float(parts[month])
-            except Exception:
-                continue
-            rows.append((datetime(year, month, 1), anomaly))
+            # Force datetime + numeric (prevents .dt errors)
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df["Temp_Anomaly"] = pd.to_numeric(df["Temp_Anomaly"], errors="coerce")
+            df = df.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
 
-    df = pd.DataFrame(rows, columns=["Date", "SST_Anomaly"])
+            if not df.empty:
+                return df, "NOAA ERSST v5 (global SST anomaly index)"
+    except Exception:
+        pass
 
-    # ✅ Critical fix: force datetime type (prevents ".dt" AttributeError)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    # -------- Fallback: DataHub monthly global temp anomalies CSV --------
+    r2 = _http_get(DATAHUB_GLOBAL_TEMP_MONTHLY_CSV)
+    if r2.status_code != 200:
+        raise RuntimeError(
+            f"Could not download temperature data. "
+            f"NOAA status: unavailable; DataHub status: {r2.status_code}"
+        )
 
-    # Ensure numeric
-    df["SST_Anomaly"] = pd.to_numeric(df["SST_Anomaly"], errors="coerce")
-    df = df.dropna(subset=["SST_Anomaly"]).reset_index(drop=True)
+    df2 = pd.read_csv(pd.io.common.StringIO(r2.text))
 
-    return df
+    # DataHub format: Source, Date (YYYY-MM), Mean
+    if "Date" not in df2.columns or "Mean" not in df2.columns:
+        raise RuntimeError("Fallback dataset format changed (missing Date/Mean columns).")
 
+    df2 = df2.rename(columns={"Mean": "Temp_Anomaly"})
+    df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce")
+    df2["Temp_Anomaly"] = pd.to_numeric(df2["Temp_Anomaly"], errors="coerce")
+    df2 = df2.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
 
-# Load data
-with st.spinner("Loading NOAA SST anomaly data..."):
-    df = load_sst_data()
+    # Optional: let user pick which source (GCAG vs GISTEMP) later; for now keep both
+    # (Still works fine for graphs/correlation)
+    return df2, "DataHub Global Temp (Land+Ocean anomalies; proxy fallback)"
 
-if df.empty:
-    st.error("No data loaded. Please try again later or check the NOAA data source.")
-    st.stop()
 
 # -----------------------------
-# SIDEBAR
+# LOAD DATA (safe error handling)
+# -----------------------------
+try:
+    with st.spinner("Loading temperature anomaly data..."):
+        df, source_name = load_temperature_data()
+except Exception as e:
+    st.error("Failed to load temperature data from the internet.")
+    st.write("Details (safe):", str(e))
+    st.info(
+        "If you’re on Streamlit Cloud, some NOAA endpoints can be blocked or temporarily down. "
+        "Try again later, or use the 'Upload your own SST CSV' option below."
+    )
+    df = pd.DataFrame(columns=["Date", "Temp_Anomaly"])
+    source_name = "None"
+
+if df.empty:
+    st.subheader("⬇️ Upload your own SST / temperature anomaly CSV (backup option)")
+    st.markdown(
+        "Upload a CSV with a **Date** column and a **Temp_Anomaly** column (or choose columns after upload)."
+    )
+    up = st.file_uploader("Upload temperature CSV", type=["csv"])
+    if up is None:
+        st.stop()
+
+    user_df = pd.read_csv(up)
+    st.dataframe(user_df.head(10))
+
+    date_col = st.selectbox("Select date column", options=user_df.columns)
+    val_col = st.selectbox("Select anomaly/value column", options=user_df.columns)
+
+    df = user_df[[date_col, val_col]].rename(columns={date_col: "Date", val_col: "Temp_Anomaly"})
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Temp_Anomaly"] = pd.to_numeric(df["Temp_Anomaly"], errors="coerce")
+    df = df.dropna(subset=["Date", "Temp_Anomaly"]).sort_values("Date").reset_index(drop=True)
+    source_name = "User uploaded dataset"
+
+st.success(f"Loaded data source: **{source_name}**")
+
+
+# -----------------------------
+# SIDEBAR CONTROLS
 # -----------------------------
 st.sidebar.header("🔍 Analysis Settings")
 
@@ -110,148 +188,140 @@ start_year = st.sidebar.slider("Start Year", min_year, max_year, max(min_year, 1
 end_year = st.sidebar.slider("End Year", min_year, max_year, max_year)
 
 if start_year > end_year:
-    st.sidebar.warning("Start Year is greater than End Year. Swapping them.")
     start_year, end_year = end_year, start_year
 
 use_openai = st.sidebar.toggle("Use AI Interpretation (OpenAI)", value=False)
-model_name = st.sidebar.text_input("OpenAI model", value="gpt-5.2", help="Optional. Used only if OpenAI is enabled.")
+model_name = st.sidebar.text_input("OpenAI model", value="gpt-5.2")
 
-st.sidebar.divider()
-st.sidebar.caption("Tip: If OpenAI is OFF, the app still works using graphs + statistics.")
-
-# Filter
 filtered_df = df[(df["Date"].dt.year >= start_year) & (df["Date"].dt.year <= end_year)].copy()
+filtered_df = filtered_df.sort_values("Date").reset_index(drop=True)
 
 if filtered_df.empty:
     st.warning("No data found in the selected year range.")
     st.stop()
 
+
 # -----------------------------
-# SST TIME SERIES PLOT
+# PLOT TEMPERATURE ANOMALIES
 # -----------------------------
-st.subheader("📈 Sea Surface Temperature (SST) Anomalies")
+st.subheader("📈 Temperature Anomalies Over Time")
 
 fig, ax = plt.subplots()
-ax.plot(filtered_df["Date"], filtered_df["SST_Anomaly"])
+ax.plot(filtered_df["Date"], filtered_df["Temp_Anomaly"])
 ax.set_xlabel("Year")
-ax.set_ylabel("SST Anomaly (°C)")
-ax.set_title(f"Global SST Anomalies (NOAA ERSST v5) — {start_year} to {end_year}")
+ax.set_ylabel("Anomaly (°C)")
+ax.set_title(f"Temperature Anomalies — {start_year} to {end_year}")
 st.pyplot(fig)
+
 
 # -----------------------------
 # TREND ANALYSIS
 # -----------------------------
 st.subheader("📊 Trend Analysis")
 
-# Linear trend using ordinal dates
 x = filtered_df["Date"].map(datetime.toordinal).to_numpy()
-y = filtered_df["SST_Anomaly"].to_numpy()
+y = filtered_df["Temp_Anomaly"].to_numpy()
 
 if len(x) >= 2:
     slope_per_day, intercept = np.polyfit(x, y, 1)
     slope_per_year = slope_per_day * 365.25
-
-    st.write(f"Estimated warming trend: **{slope_per_year:.4f} °C per year**")
+    st.write(f"Estimated trend: **{slope_per_year:.4f} °C per year**")
 else:
-    st.write("Not enough data points to compute a trend.")
     slope_per_year = float("nan")
+    st.write("Not enough data points to compute trend.")
 
-# Quick stats
 st.write(
-    f"Average anomaly: **{filtered_df['SST_Anomaly'].mean():.3f} °C** • "
-    f"Max: **{filtered_df['SST_Anomaly'].max():.3f} °C** • "
-    f"Min: **{filtered_df['SST_Anomaly'].min():.3f} °C**"
+    f"Mean anomaly: **{filtered_df['Temp_Anomaly'].mean():.3f} °C** • "
+    f"Max: **{filtered_df['Temp_Anomaly'].max():.3f} °C** • "
+    f"Min: **{filtered_df['Temp_Anomaly'].min():.3f} °C**"
 )
 
+
 # -----------------------------
-# CORRELATION DEMO (WITH USER-PROVIDED FISH DATA)
+# FISH DATA UPLOAD + CORRELATION
 # -----------------------------
-st.subheader("🐟 Fish Migration / Catch Data (Optional)")
+st.subheader("🐟 Compare With Fish Catch / Migration Data")
 
 st.markdown(
-    "If you have fish catch or migration data (monthly), upload a CSV to compare with SST anomalies.\n\n"
-    "**CSV requirements:** a date column + a numeric column (e.g., catch, abundance index, latitude shift)."
+    "Upload a CSV with a **date column** (monthly is best) and a **fish metric column** "
+    "(catch, abundance index, migration latitude, etc.)."
 )
 
-uploaded = st.file_uploader("Upload fish data CSV", type=["csv"])
+fish_upload = st.file_uploader("Upload fish CSV", type=["csv"], key="fish_csv")
 
-fish_df = None
 merged = None
 
-if uploaded is not None:
+if fish_upload is not None:
     try:
-        fish_df = pd.read_csv(uploaded)
-        st.write("Preview of uploaded data:")
+        fish_df = pd.read_csv(fish_upload)
+        st.write("Preview:")
         st.dataframe(fish_df.head(10))
 
-        # Let user choose columns
-        date_col = st.selectbox("Select the date column", options=fish_df.columns)
-        value_col = st.selectbox("Select the numeric fish column", options=fish_df.columns)
+        fish_date_col = st.selectbox("Fish date column", options=fish_df.columns, key="fish_date")
+        fish_value_col = st.selectbox("Fish metric column", options=fish_df.columns, key="fish_val")
 
-        fish_df = fish_df[[date_col, value_col]].copy()
-        fish_df.rename(columns={date_col: "Date", value_col: "Fish_Value"}, inplace=True)
+        fish_df = fish_df[[fish_date_col, fish_value_col]].copy()
+        fish_df.rename(columns={fish_date_col: "Date", fish_value_col: "Fish_Value"}, inplace=True)
 
         fish_df["Date"] = pd.to_datetime(fish_df["Date"], errors="coerce")
         fish_df["Fish_Value"] = pd.to_numeric(fish_df["Fish_Value"], errors="coerce")
         fish_df = fish_df.dropna(subset=["Date", "Fish_Value"]).sort_values("Date")
 
-        # Make monthly key for merge (YYYY-MM)
+        # Merge by month (YYYY-MM)
         filtered_df["YearMonth"] = filtered_df["Date"].dt.to_period("M").astype(str)
         fish_df["YearMonth"] = fish_df["Date"].dt.to_period("M").astype(str)
 
         merged = pd.merge(
-            filtered_df[["YearMonth", "SST_Anomaly"]],
+            filtered_df[["YearMonth", "Temp_Anomaly"]],
             fish_df[["YearMonth", "Fish_Value"]],
             on="YearMonth",
             how="inner",
         )
 
         if merged.empty:
-            st.warning("No overlapping months found between SST data and your fish dataset.")
+            st.warning("No overlapping months found between temperature data and fish data.")
         else:
-            st.success(f"Merged dataset has {len(merged)} overlapping months.")
-            st.dataframe(merged.head(10))
-
-            corr = merged["SST_Anomaly"].corr(merged["Fish_Value"])
-            st.write(f"Correlation (SST anomaly vs Fish value): **{corr:.3f}**")
-
-            st.line_chart(merged.set_index("YearMonth")[["SST_Anomaly", "Fish_Value"]])
+            st.success(f"Overlapping months: {len(merged)}")
+            corr = merged["Temp_Anomaly"].corr(merged["Fish_Value"])
+            st.write(f"Correlation (Temp anomaly vs Fish metric): **{corr:.3f}**")
+            st.line_chart(merged.set_index("YearMonth")[["Temp_Anomaly", "Fish_Value"]])
 
     except Exception as e:
-        st.error(f"Could not read/parse your CSV. Error: {e}")
+        st.error(f"Could not parse fish CSV: {e}")
+
 
 # -----------------------------
-# SIMPLE SIMULATION (IF NO FISH DATA)
+# DEMONSTRATION MODEL (IF NO FISH DATA)
 # -----------------------------
-st.subheader("🧪 Demonstration Model (If no fish data uploaded)")
+st.subheader("🧪 Demonstration: Simulated Poleward Shift (if no fish data)")
 
 st.caption(
-    "This is a simple *illustration* showing how migration might shift with warming. "
-    "Replace this with real catch/migration data for a true research result."
+    "This is a simple illustration: warming → poleward shift. Replace with real fish data for real conclusions."
 )
 
-# Simulate poleward shift: e.g., 2° latitude per 1°C anomaly (adjustable)
-shift_factor = st.slider("Migration shift factor (degrees latitude per 1°C anomaly)", 0.0, 5.0, 2.0, 0.1)
-sim_shift = filtered_df["SST_Anomaly"] * shift_factor
+shift_factor = st.slider("Shift factor (degrees latitude per 1°C anomaly)", 0.0, 5.0, 2.0, 0.1)
+sim_shift = filtered_df["Temp_Anomaly"] * shift_factor
 
-demo_df = pd.DataFrame(
+demo = pd.DataFrame(
     {
         "Date": filtered_df["Date"],
-        "SST_Anomaly (°C)": filtered_df["SST_Anomaly"].values,
-        "Simulated Poleward Shift (° lat)": sim_shift.values,
+        "Temp_Anomaly (°C)": filtered_df["Temp_Anomaly"].values,
+        "Simulated Shift (° lat)": sim_shift.values,
     }
 ).set_index("Date")
 
-st.line_chart(demo_df)
+st.line_chart(demo)
+
 
 # -----------------------------
 # OPENAI INTERPRETATION (OPTIONAL)
 # -----------------------------
-def get_openai_key() -> str | None:
+def get_openai_key() -> Optional[str]:
     try:
         return st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
         return os.getenv("OPENAI_API_KEY")
+
 
 if use_openai:
     if not OPENAI_AVAILABLE:
@@ -259,77 +329,75 @@ if use_openai:
     else:
         key = get_openai_key()
         if not key:
-            st.warning("No OPENAI_API_KEY found. Add it in Streamlit Secrets.")
+            st.warning("No OPENAI_API_KEY found. Add it in Streamlit Secrets to enable AI interpretation.")
         else:
             client = OpenAI(api_key=key)
 
-            # Build a concise summary for the model (keeps cost low)
-            summary_lines = [
+            summary = [
+                f"Data source: {source_name}",
                 f"Year range: {start_year}–{end_year}",
-                f"Mean SST anomaly: {filtered_df['SST_Anomaly'].mean():.3f} °C",
-                f"Trend: {slope_per_year:.4f} °C per year" if np.isfinite(slope_per_year) else "Trend: N/A",
-                f"Max anomaly: {filtered_df['SST_Anomaly'].max():.3f} °C",
-                f"Min anomaly: {filtered_df['SST_Anomaly'].min():.3f} °C",
+                f"Mean anomaly: {filtered_df['Temp_Anomaly'].mean():.3f} °C",
+                f"Trend: {slope_per_year:.4f} °C/year" if np.isfinite(slope_per_year) else "Trend: N/A",
+                f"Max anomaly: {filtered_df['Temp_Anomaly'].max():.3f} °C",
+                f"Min anomaly: {filtered_df['Temp_Anomaly'].min():.3f} °C",
             ]
             if merged is not None and not merged.empty:
-                corr = merged["SST_Anomaly"].corr(merged["Fish_Value"])
-                summary_lines.append(f"Fish dataset correlation with SST anomaly: {corr:.3f}")
+                corr = merged["Temp_Anomaly"].corr(merged["Fish_Value"])
+                summary.append(f"Fish correlation: {corr:.3f}")
 
             prompt = (
-                "You are helping a student explain a science fair project about how sea surface temperature "
-                "changes relate to fish migration and fisheries. Use simple, clear language.\n\n"
-                "Here are the results:\n- " + "\n- ".join(summary_lines) + "\n\n"
+                "Explain a science fair project about how ocean temperature anomalies relate to fish migration. "
+                "Use simple, clear language.\n\nResults:\n- " + "\n- ".join(summary) + "\n\n"
                 "Explain:\n"
-                "1) What the SST anomaly trend means,\n"
-                "2) How warming can affect fish migration (timing and location),\n"
-                "3) Why satellite data is useful for monitoring,\n"
-                "4) What a school-level conclusion could be.\n"
-                "Avoid inventing exact fish species or locations unless provided."
+                "1) What the trend means,\n"
+                "2) How warming affects fish migration (timing + location),\n"
+                "3) Why satellite/large-scale datasets help,\n"
+                "4) A short conclusion and limitations.\n"
+                "Do not invent species or local catch details unless provided."
             )
 
             try:
-                resp = client.responses.create(
-                    model=model_name,
-                    input=prompt,
-                )
+                resp = client.responses.create(model=model_name, input=prompt)
                 st.subheader("🤖 AI Interpretation")
                 st.write(resp.output_text)
             except Exception as e:
                 st.error(f"OpenAI request failed: {e}")
 
-# -----------------------------
-# DOWNLOADS
-# -----------------------------
-st.subheader("⬇️ Download SST Data (Selected Range)")
 
-csv_bytes = filtered_df[["Date", "SST_Anomaly"]].to_csv(index=False).encode("utf-8")
+# -----------------------------
+# DOWNLOAD
+# -----------------------------
+st.subheader("⬇️ Download Temperature Data (Selected Range)")
+
+out = filtered_df[["Date", "Temp_Anomaly"]].to_csv(index=False).encode("utf-8")
 st.download_button(
-    "Download SST anomalies CSV",
-    data=csv_bytes,
-    file_name=f"sst_anomalies_{start_year}_{end_year}.csv",
+    "Download CSV",
+    data=out,
+    file_name=f"temperature_anomalies_{start_year}_{end_year}.csv",
     mime="text/csv",
 )
+
 
 # -----------------------------
 # PROJECT SUMMARY
 # -----------------------------
-st.subheader("🌍 Project Summary (for your science fair board)")
+st.subheader("🌍 Project Summary (for your poster)")
 
 st.markdown(
     """
-**Goal:** Use satellite-derived sea surface temperature (SST) anomaly data to study how ocean warming can influence fish migration.
+**Goal:** Study how changes in ocean temperature can influence fish migration patterns.
 
-**Method:**  
-- Download monthly global SST anomaly data (NOAA ERSST v5).  
-- Visualize changes over time and calculate a warming trend.  
-- (Optional) Upload fish migration/catch data to compute correlation with SST anomalies.
+**Method:**
+- Load a public temperature anomaly dataset (preferably SST anomalies; fallback uses a global land+ocean anomaly proxy if needed).
+- Plot anomalies over time and compute a warming trend.
+- Upload fish catch/migration data and test correlation with temperature anomalies (monthly).
 
-**Why it matters:**  
-Warmer waters can shift where fish live and breed, affecting fisheries, food supply, and conservation planning.
+**Why it matters:**
+Warming oceans can shift where fish live and breed, affecting fisheries, food security, and conservation planning.
 
-**Extension ideas:**  
-- Use regional SST instead of global (specific ocean area).  
-- Compare multiple species’ catch records.  
-- Add maps (lat/long) for true migration tracking.
+**Extensions:**
+- Use regional SST (Indian Ocean / Kenya coast) instead of global.
+- Add maps for spatial migration.
+- Compare multiple fish species datasets.
 """
 )
