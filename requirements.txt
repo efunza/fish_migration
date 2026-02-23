@@ -1,0 +1,6 @@
+streamlit>=1.32.0
+pandas
+numpy
+matplotlib
+requests
+openai>=1.40.0
